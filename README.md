@@ -3,13 +3,13 @@ Android I/O redirection implementation, using seccomp user notify mechanism
 
 * At least kernel version **5.10** required
 * This example has been tested on `aarch64`, `x86_64` and `riscv64` architectures
-* This example currently only supports debug build
+* This example currently only supports debug build, in release build you should implement memory read and write yourself
 
 使用 seccomp user notify 机制的 Android I/O 重定向实现
 
 * 至少需要 **5.10** 版本内核
 * 本示例已在 `aarch64`, `x86_64` 与 `riscv64` 架构上测试通过
-* 本示例目前仅支持 debug 构建
+* 本示例目前仅支持 debug 构建, 在 release 构建时你应该自行实现内存读写
 
 [Download example](https://github.com/eirv/SimpleIORedirect/raw/main/app-debug.apk)
 
