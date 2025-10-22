@@ -14,3 +14,8 @@ Android I/O redirection implementation, using seccomp user notify mechanism
 [Download example](https://github.com/eirv/SimpleIORedirect/raw/main/app-debug.apk)
 
 提示: ~~稍加修改可以对最新某数字加固实现过签~~
+
+看来已经开始有人用于过签360加固了🤔
+![A](imgs/a.png)
+![B](imgs/b.png)
+![C](imgs/c.jpg)
