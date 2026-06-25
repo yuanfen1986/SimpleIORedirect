@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
+#include <linux/openat2.h>
 #include <linux/seccomp.h>
 #include <linux/version.h>
 #include <signal.h>
@@ -13,12 +14,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/utsname.h>
 #include <syscall.h>
 #include <unistd.h>
+
+#ifndef __NR_openat2
+#if defined(__x86_64__)
+#define __NR_openat2 437
+#elif defined(__i386__)
+#define __NR_openat2 437
+#elif defined(__aarch64__)
+#define __NR_openat2 437
+#elif defined(__riscv)
+#define __NR_openat2 437
+#endif
+#endif
 
 #include "logging.h"
 
@@ -152,19 +166,9 @@ private:
     pid_t pid_;
 };
 
-void EnterSupervisor(int nfd, const char *target, const char *redirection) {
-    seccomp_notif *req;
-    seccomp_notif_resp *resp;
-    seccomp_notif_sizes sizes{};
-
-    if (seccomp(SECCOMP_GET_NOTIF_SIZES, 0, &sizes) == 0) {
-        req = reinterpret_cast<decltype(req)>(malloc(sizes.seccomp_notif));
-        resp = reinterpret_cast<decltype(resp)>(malloc(sizes.seccomp_notif_resp));
-    } else {
-        LOGE("seccomp(SECCOMP_GET_NOTIF_SIZES): %m");
-        return;
-    }
-
+void EnterSupervisor(int nfd, const char *target, const char *redirection,
+                     seccomp_notif *req, seccomp_notif_resp *resp,
+                     seccomp_notif_sizes sizes) {
     char path[PATH_MAX];
 
     for (;;) {
@@ -172,7 +176,7 @@ void EnterSupervisor(int nfd, const char *target, const char *redirection) {
         if (ioctl(nfd, SECCOMP_IOCTL_NOTIF_RECV, req) < 0) {
             if (errno == EINTR) continue;
             LOGE("ioctl(SECCOMP_IOCTL_NOTIF_RECV): %m");
-            goto exit;
+            break;
         }
 
         memset(resp, 0, sizes.seccomp_notif_resp);
@@ -186,8 +190,19 @@ void EnterSupervisor(int nfd, const char *target, const char *redirection) {
             LOGV("open: %s", path);
 
             if (strcmp(path, target) == 0) {
-                int srcfd = openat(AT_FDCWD, redirection, req->data.args[2],
-                                       req->data.args[3]);
+                int srcfd;
+                if (req->data.nr == __NR_openat2) {
+                    struct open_how how{};
+                    if (mem.Read(req->data.args[2], &how, sizeof(how)) > 0) {
+                        srcfd = openat(AT_FDCWD, redirection, how.flags, how.mode);
+                    } else {
+                        srcfd = -1;
+                    }
+                } else {
+                    srcfd = openat(AT_FDCWD, redirection, req->data.args[2],
+                                   req->data.args[3]);
+                }
+
                 if (srcfd > 0) {
                     seccomp_notif_addfd addfd = {.id = req->id,
                             .flags = 0 /* SECCOMP_ADDFD_FLAG_SEND */,
@@ -209,7 +224,6 @@ void EnterSupervisor(int nfd, const char *target, const char *redirection) {
         }
     }
 
-    exit:
     free(req);
     free(resp);
     LOGD("supervisor exit");
@@ -231,9 +245,29 @@ bool InitIORedirect(const char *target, const char *redirection) {
 
     prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 
+    /* Allocate supervisor structures BEFORE fork to avoid deadlock from
+       inherited heap lock state in multi-threaded environments */
+    seccomp_notif_sizes sizes{};
+    seccomp_notif *req = nullptr;
+    seccomp_notif_resp *resp = nullptr;
+    if (seccomp(SECCOMP_GET_NOTIF_SIZES, 0, &sizes) == 0) {
+        req = reinterpret_cast<decltype(req)>(malloc(sizes.seccomp_notif));
+        resp = reinterpret_cast<decltype(resp)>(malloc(sizes.seccomp_notif_resp));
+        if (!req || !resp) {
+            LOGE("malloc: %m");
+            free(req);
+            free(resp);
+            return false;
+        }
+    } else {
+        LOGE("seccomp(SECCOMP_GET_NOTIF_SIZES): %m");
+        return false;
+    }
+
     sock_filter filter[] = {
             BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
-            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat, 1, 0),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat, 2, 0),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat2, 1, 0),
             BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
             BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
     };
@@ -243,28 +277,57 @@ bool InitIORedirect(const char *target, const char *redirection) {
     int socked_fds[2];
     socketpair(AF_UNIX, SOCK_STREAM, 0, socked_fds);
 
+    /* Also copy strings before fork so child doesn't call malloc */
+    char *t_dup = strdup(target);
+    char *r_dup = strdup(redirection);
+    if (!t_dup || !r_dup) {
+        LOGE("strdup: %m");
+        free(t_dup);
+        free(r_dup);
+        free(req);
+        free(resp);
+        return false;
+    }
+
     int supervisor_pid = fork();
     if (supervisor_pid < 0) {
         LOGE("Failed to fork supervisor");
+        free(t_dup);
+        free(r_dup);
+        free(req);
+        free(resp);
         return false;
     } else if (supervisor_pid == 0) {
         int notify_fd = recvfd(socked_fds[1]);
         close(socked_fds[0]);
         close(socked_fds[1]);
-        EnterSupervisor(notify_fd, strdup(target), strdup(redirection));
+        EnterSupervisor(notify_fd, t_dup, r_dup, req, resp, sizes);
+        /* never reaches here */
     }
+
+    /* Parent: free pre-allocated copies */
+    free(t_dup);
+    free(r_dup);
 
     int notify_fd = seccomp(SECCOMP_SET_MODE_FILTER,
                                 SECCOMP_FILTER_FLAG_NEW_LISTENER, &prog);
     if (notify_fd < 0) {
         LOGE("seccomp: %m");
+        free(req);
+        free(resp);
         return false;
     }
+
+    fcntl(notify_fd, F_SETFD, FD_CLOEXEC);
+    fcntl(socked_fds[0], F_SETFD, FD_CLOEXEC);
+    fcntl(socked_fds[1], F_SETFD, FD_CLOEXEC);
 
     sendfd(socked_fds[0], notify_fd);
     close(socked_fds[0]);
     close(socked_fds[1]);
     close(notify_fd);
+    free(req);
+    free(resp);
 
     return true;
 }
