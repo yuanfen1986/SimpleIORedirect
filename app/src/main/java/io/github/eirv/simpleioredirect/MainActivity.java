@@ -37,7 +37,7 @@ public class MainActivity extends Activity {
         if (!redirect(TARGET_PATH, redirection.getPath())) {
             new AlertDialog.Builder(this)
                     .setTitle("Error")
-                    .setMessage("This example cannot be run on your device and requires at least kernel version 5.10")
+                    .setMessage("This example cannot be run on your device and requires at least kernel version 5.11")
                     .setPositiveButton(android.R.string.ok, null)
                     .create()
                     .show();

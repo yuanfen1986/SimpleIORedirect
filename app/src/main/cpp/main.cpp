@@ -204,10 +204,16 @@ void EnterSupervisor(int nfd, const char *target, const char *redirection,
                 }
 
                 if (srcfd > 0) {
-                    seccomp_notif_addfd addfd = {.id = req->id,
-                            .flags = 0 /* SECCOMP_ADDFD_FLAG_SEND */,
-                            .srcfd = static_cast<uint32_t>(srcfd)};
-                    resp->val = ioctl(nfd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd);
+                    seccomp_notif_addfd addfd{};
+                    addfd.id = req->id;
+                    addfd.flags = 0;
+                    addfd.srcfd = static_cast<uint32_t>(srcfd);
+                    int addfd_ret = ioctl(nfd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd);
+                    if (addfd_ret < 0) {
+                        resp->error = -errno;
+                    } else {
+                        resp->val = addfd_ret;
+                    }
                     close(srcfd);
                 } else {
                     resp->error = -errno;
@@ -238,7 +244,7 @@ bool InitIORedirect(const char *target, const char *redirection) {
     int kernel_major = strtol(un.release, &str, 10);
     int kernel_minor = strtol(str + 1, nullptr, 10);
 
-    if (KERNEL_VERSION(kernel_major, kernel_minor, 0) < KERNEL_VERSION(5, 9, 0)) {
+    if (KERNEL_VERSION(kernel_major, kernel_minor, 0) < KERNEL_VERSION(5, 11, 0)) {
         LOGE("Kernel(%s) not supported", un.release);
         return false;
     }
